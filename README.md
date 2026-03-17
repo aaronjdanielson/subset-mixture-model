@@ -1,5 +1,8 @@
 # Subset Mixture Model (SMM)
 
+[![PyPI version](https://badge.fury.io/py/subset-mixture-model.svg)](https://pypi.org/project/subset-mixture-model/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **SMM** is an interpretable, empirical-Bayes method for regression on datasets with categorical features. It aggregates partition-based conditional-mean estimators over all non-empty feature subsets using learned simplex weights, adaptively balancing bias and variance across partition granularities.
 
 ## Key idea
