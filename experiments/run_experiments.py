@@ -257,6 +257,68 @@ def run_lgbm(train_df, test_df, cat_cols, target):
     }
 
 
+def run_catboost(train_df, test_df, cat_cols, target):
+    try:
+        from catboost import CatBoostRegressor
+    except ImportError:
+        print("  CatBoost not installed — skipping.")
+        return {"RMSE": None, "MAE": None, "NLL": None, "Cov95": None}
+
+    # CatBoost accepts integer-encoded categoricals natively via cat_features.
+    X_tr = train_df[cat_cols].values
+    X_te = test_df[cat_cols].values
+    y_tr = train_df[target].values
+    y_te = test_df[target].values
+
+    cat_idx = list(range(len(cat_cols)))
+    model = CatBoostRegressor(iterations=300, random_seed=42, verbose=0)
+    model.fit(X_tr, y_tr, cat_features=cat_idx)
+    y_hat = model.predict(X_te)
+    resid_std = float(np.std(y_tr - model.predict(X_tr)))
+    return {
+        "RMSE":  rmse(y_te, y_hat),
+        "MAE":   mae(y_te, y_hat),
+        "NLL":   gaussian_nll(y_te, y_hat, np.full_like(y_hat, resid_std)),
+        "Cov95": coverage_95(y_te, y_hat, np.full_like(y_hat, resid_std)),
+    }
+
+
+def run_mapie_catboost(train_df, val_df, test_df, cat_cols, target):
+    """CatBoost wrapped with split-conformal MAPIE for calibrated coverage."""
+    try:
+        from catboost import CatBoostRegressor
+        from mapie.regression import MapieRegressor
+    except ImportError:
+        print("  CatBoost or MAPIE not installed — skipping.")
+        return {"RMSE": None, "MAE": None, "NLL": None, "Cov95": None}
+
+    X_tr = train_df[cat_cols].values
+    X_va = val_df[cat_cols].values
+    X_te = test_df[cat_cols].values
+    y_tr = train_df[target].values
+    y_va = val_df[target].values
+    y_te = test_df[target].values
+
+    cat_idx = list(range(len(cat_cols)))
+    base = CatBoostRegressor(iterations=300, random_seed=42, verbose=0)
+    base.fit(X_tr, y_tr, cat_features=cat_idx)
+
+    mapie = MapieRegressor(estimator=base, method="base", cv="prefit")
+    mapie.fit(X_va, y_va)
+
+    y_hat, pi = mapie.predict(X_te, alpha=0.05)
+    lower = pi[:, 0, 0]
+    upper = pi[:, 1, 0]
+    y_std = np.maximum((upper - lower) / (2 * 1.96), 1e-6)
+    cov95 = float(((y_te >= lower) & (y_te <= upper)).mean())
+    return {
+        "RMSE":  rmse(y_te, y_hat),
+        "MAE":   mae(y_te, y_hat),
+        "NLL":   gaussian_nll(y_te, y_hat, y_std),
+        "Cov95": cov95,
+    }
+
+
 # ---------------------------------------------------------------------------
 # SMM training
 # ---------------------------------------------------------------------------
@@ -431,6 +493,10 @@ def main():
         all_rows.append(row("NGBoost",       run_ngboost(train_df, test_df, cat_cols, target)))
         print("  MAPIE-LightGBM (conformal)...")
         all_rows.append(row("MAPIE-LightGBM", run_mapie_lgbm(train_df, val_df, test_df, cat_cols, target)))
+        print("  CatBoost...")
+        all_rows.append(row("CatBoost",       run_catboost(train_df, test_df, cat_cols, target)))
+        print("  MAPIE-CatBoost (conformal)...")
+        all_rows.append(row("MAPIE-CatBoost", run_mapie_catboost(train_df, val_df, test_df, cat_cols, target)))
 
         print("  SMM...")
         predictor, subset_maker, model = train_smm(train_df, val_df, cat_cols, target, ds_name)
