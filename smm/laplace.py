@@ -14,10 +14,15 @@ Transforming to the simplex via pi = softmax(eta) and applying the delta method:
 
 where J = d(pi)/d(eta) is the |S| x |S| softmax Jacobian.
 
-Predictive variance for a new point x_tilde then decomposes as:
+Predictive variance for a new point x_tilde decomposes as:
 
-    Var[y | x_tilde] ≈  sum_s pi_s * sigma^2_s(x_tilde)        [aleatoric]
-                      +  mu_{x_tilde}^T Sigma_pi mu_{x_tilde}   [epistemic]
+    Var[y | x_tilde] ≈  sum_s pi_s * (sigma^2_s(x_tilde) + mu_s(x_tilde)^2)
+                        - y_hat(x_tilde)^2                       [aleatoric]
+                      + mu_{x_tilde}^T Sigma_pi mu_{x_tilde}     [epistemic]
+
+The aleatoric term is the exact variance of the Gaussian mixture at the MAP
+weights (within-component noise plus between-component scatter). The epistemic
+term propagates uncertainty in the learned weights via the delta method.
 
 References:
     MacKay, D.J.C. (1992). A Practical Bayesian Framework for Backpropagation Networks.
@@ -216,8 +221,9 @@ def predict_with_uncertainty(
         y_mean_weighted,
     )
 
-    # --- Aleatoric variance: E_pi[sigma^2(x)] = sum_s pi_s * sigma_s^2(x) ---
-    aleatoric_var = (norm_weights * vars_m).sum(dim=1)     # [B]
+    # --- Aleatoric variance: exact mixture variance = within + between component ---
+    # Var[y|x,pi] = sum_s pi_s*(sigma_s^2 + mu_s^2) - y_hat^2
+    aleatoric_var = (norm_weights * (vars_m + mus_m ** 2)).sum(dim=1) - y_mean_weighted ** 2  # [B]
     # Fallback: use global training variance
     aleatoric_var = torch.where(
         fallback_mask,
