@@ -3,15 +3,29 @@
 [![PyPI version](https://badge.fury.io/py/subset-mixture-model.svg)](https://pypi.org/project/subset-mixture-model/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**SMM** is an interpretable, empirical-Bayes method for regression on datasets with categorical features. It aggregates partition-based conditional-mean estimators over all non-empty feature subsets using learned simplex weights, adaptively balancing bias and variance across partition granularities.
+**SMM** is an interpretable, uncertainty-aware regression method for data with
+categorical features. It learns a global convex mixture over *subset-induced
+partition estimators*—one per non-empty feature subset—and returns a full
+predictive distribution together with a transparent account of *why* each
+prediction has the value and the uncertainty it does.
 
-## Key idea
+Version 0.2 upgrades the method to be genuinely probabilistic:
 
-Each feature subset $s$ induces a partition of the covariate space and a natural estimator of the conditional expectation — its empirical cell mean. SMM learns a convex combination of these estimators:
+- **Cross-fitted weights** — subset cell means are multiway target encodings, so
+  the mixture weights are learned on out-of-fold statistics to avoid target
+  leakage (small, high-order cells no longer get to memorize the response).
+- **Conjugate Student-t cells** — each cell uses a Normal-Inverse-Gamma
+  posterior, so its predictive component is a Student-t that widens and grows
+  heavy tails in sparse cells (the plug-in Gaussian is the large-sample limit).
+- **Exact mixture inference** — NLL, CDF, central intervals (by bisection) and
+  CRPS are computed exactly from the mixture of Student-t components.
+- **Four-part predictive variance** — within-cell noise, cell-estimation
+  uncertainty, subset-resolution disagreement, and weight uncertainty (Laplace).
+- **Interpretation as diagnostics** — the learned weights are summarized by
+  entropy, effective number of subsets, order-level mass, and concentration,
+  rather than claimed to be a sparse ANOVA decomposition.
 
-$$\hat{f}(\mathbf{x}) = \sum_{s \in \mathcal{S}} \hat{\pi}_s \cdot \hat{\mu}_{m(s,\mathbf{x})}(s)$$
-
-The learned weights $\hat{\pi}_s$ are directly interpretable: they reveal which feature interactions drive predictions on average. Uncertainty is propagated from the MAP weight estimates via a Laplace approximation, yielding aleatoric/epistemic decompositions without post-hoc calibration.
+---
 
 ## Installation
 
@@ -19,103 +33,131 @@ The learned weights $\hat{\pi}_s$ are directly interpretable: they reveal which 
 pip install subset-mixture-model
 ```
 
-Or from source:
-
-```bash
-git clone https://github.com/aaronjdanielson/subset-mixture-model
-cd subset-mixture-model
-pip install -e .
-```
-
-## Quick start
+Import as `smm`:
 
 ```python
-import pandas as pd
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
-from smm import (
-    SubsetMaker, SubsetWeightsModel, SubsetDataset,
-    subset_mixture_neg_log_posterior, SubsetMixturePredictor,
-    compute_posterior_covariance, predict_with_uncertainty,
-)
-
-# --- your data (integer-coded categorical features) ---
-train_df = pd.read_csv("train.csv")
-val_df   = pd.read_csv("val.csv")
-test_df  = pd.read_csv("test.csv")
-
-cat_cols = ["feature_a", "feature_b", "feature_c"]
-target   = "y"
-
-# --- build lookup table ---
-subset_maker = SubsetMaker(train_df, cat_cols, [target])
-n_subsets = len(subset_maker.lookup)
-
-# --- train ---
-model     = SubsetWeightsModel(n_subsets)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-loader    = DataLoader(SubsetDataset(train_df, cat_cols, [target]),
-                       batch_size=64, shuffle=True)
-
-for epoch in range(100):
-    for x, y in loader:
-        optimizer.zero_grad()
-        mus, variances, mask = subset_maker.batch_lookup(x)
-        loss = subset_mixture_neg_log_posterior(
-            model(), y, mus, variances, mask, alpha=1.1)
-        loss.backward()
-        optimizer.step()
-
-# --- predict with uncertainty ---
-pi_hat    = F.softmax(model.eta.detach(), dim=0)
-predictor = SubsetMixturePredictor(subset_maker, pi_hat)
-sigma_pi  = compute_posterior_covariance(
-    model, subset_maker, train_df, cat_cols, target, alpha=1.1)
-
-y_mean, y_std = predict_with_uncertainty(predictor, sigma_pi, test_df)
-# y_mean: point predictions
-# y_std:  total predictive standard deviation (aleatoric + epistemic)
+import smm
 ```
 
-## Interpretability
+Requires `torch>=2.0`, `numpy`, `pandas`, `scipy`. `plot_calibration` also needs
+`matplotlib`.
+
+---
+
+## Quickstart
 
 ```python
 import numpy as np
+import pandas as pd
+from smm import SMM
 
-subsets = list(subset_maker.lookup.keys())
-top_idx = np.argsort(pi_hat.numpy())[::-1][:10]
+# --- synthetic data: a main effect (region) + an interaction (season x tier) ---
+rng = np.random.default_rng(0)
+N = 2000
+region = rng.integers(0, 2, N)
+season = rng.integers(0, 3, N)
+tier   = rng.integers(0, 2, N)
+y = 5.0 * region + 3.0 * (season == 1) * tier + rng.normal(0, 2.0, N)
+df = pd.DataFrame({"region": region, "season": season, "tier": tier, "y": y})
 
-for rank, i in enumerate(top_idx):
-    print(f"{rank+1:2d}. {subsets[i]}  π={pi_hat[i]:.4f}")
+train, val, test = df[:1400], df[1400:1700], df[1700:]
+FEATURES, TARGET = ["region", "season", "tier"], "y"
+
+# --- fit: cross-fitted weights + conjugate Student-t cells + Laplace UQ ---
+model = SMM(FEATURES, TARGET, kappa0=1.0, lam=0.5).fit(train, val)
+
+# --- point prediction and a full predictive distribution ---
+mean = model.predict(test)
+mean, std = model.predict_with_uncertainty(test)
+lo, hi = model.interval(test, level=0.95)          # exact mixture interval
+
+y_test = test[TARGET].values
+print("RMSE :", np.sqrt(np.mean((mean - y_test) ** 2)).round(3))
+print("NLL  :", round(model.nll(test, y_test), 3))
+print("CRPS :", round(model.crps(test, y_test), 3))
+print("cov95:", round(float(((y_test >= lo) & (y_test <= hi)).mean()), 3))
 ```
 
-## Features
+### Why this prediction? Uncertainty decomposition
 
-- **Interpretable by construction**: learned weights reveal which feature interactions matter
-- **Principled uncertainty**: aleatoric/epistemic decomposition via Laplace approximation
-- **Efficient training**: only $2^D - 1$ logits optimized; lookup table precomputed once
-- **No post-hoc calibration**: well-calibrated predictive intervals out of the box
-- **Scalable to D ≤ 15** features; $k$-way truncation available for larger $D$
+```python
+mean, std, aleatoric_std, epistemic_std = model.predict_with_uncertainty(
+    test, return_components=True
+)
+# std**2 == aleatoric**2 + epistemic**2  (within-cell noise vs. everything else)
+```
 
-## Datasets supported
+### Which interactions matter? Global diagnostics
 
-Any tabular dataset with integer-coded (or string, with encoding) categorical features and a continuous target.
+```python
+print(model.weight_table(top_k=5))     # subsets ranked by learned weight
+print(model.diagnostics())             # H, N_eff, HHI, order-level mass M_k
+```
+
+`diagnostics()` returns the concentration of the weight distribution. Diffuse
+weights (large `N_eff`) are an honest signal that *no* sparse subset explanation
+dominates—prediction draws on many comparable resolutions—while concentrated
+weights identify a few dominant interactions.
+
+### Why *this* prediction? Local contributions
+
+```python
+row = test.iloc[[0]]
+print(model.explain(row))     # per-subset contributions; they sum to the prediction
+```
+
+---
+
+## What the model gives you
+
+| Method | Returns |
+|---|---|
+| `SMM(features, target, ...)` | estimator; key knobs `kappa0` (shrinkage), `alpha0`,`lam` (order-aware prior), `K` (folds), `mode` (`"nig"`/`"plugin"`), `max_order` |
+| `.fit(df, val_df=None)` | cross-fit → optimize weights (early-stop on `val_df`) → Laplace |
+| `.predict(df)` | predictive mean |
+| `.predict_with_uncertainty(df, return_components=)` | mean, std [, aleatoric, epistemic] |
+| `.nll / .crps` | exact mixture proper scores |
+| `.interval(df, level)` | exact central interval via bisection on the mixture CDF |
+| `.weight_table / .diagnostics / .explain` | interpretability outputs |
+
+Lower-level building blocks are also exported: `SubsetMaker`, `crossfit_components`,
+`SubsetMixturePredictor`, `compute_posterior_covariance`, `predict_with_uncertainty`,
+`NIGPrior`, `weight_table`, `weight_diagnostics`, `calibration_stats`.
+
+To reproduce the first-version plug-in behavior, use
+`SMM(..., mode="plugin", cross_fit=False, kappa0=0)`.
+
+---
+
+## Method summary
+
+For each non-empty feature subset *s*, SMM groups the training data by the values
+of *s* and models each resulting cell with a conjugate Normal-Inverse-Gamma
+posterior, giving a Student-t predictive component. A single global simplex
+weight vector π over all subsets is learned by MAP under an (optionally
+order-aware) Dirichlet prior, using out-of-fold cell statistics. The predictive
+distribution is the mixture ∑ₛ πₛ · tₛ, and uncertainty in π is propagated by a
+Laplace approximation in the low-dimensional logit space.
+
+SMM is intended for problems whose predictive structure is concentrated in a
+modest number of naturally categorical features (full powerset for *D ≤ 8*;
+order-restricted for larger *D*). It is a transparent, uncertainty-aware
+alternative to gradient-boosted trees in that regime, not a general replacement.
+
+---
 
 ## Citation
 
 ```bibtex
-@article{danielson2025smm,
-  title   = {Subset Mixture Model: Interpretable Empirical-Bayes Aggregation
+@article{danielson2026smm,
+  title   = {Subset Mixture Models: Interpretable Probabilistic Aggregation
              of Partition Estimators for Categorical Regression},
   author  = {Danielson, Aaron John},
-  journal = {Machine Learning},
-  year    = {2025},
-  note    = {Under review}
+  journal = {Under review},
+  year    = {2026},
 }
 ```
 
 ## License
 
-MIT
+MIT © Aaron John Danielson
